@@ -1,0 +1,10 @@
+# Pinned loosely: Colab already ships torch for the available CUDA/T4 runtime.
+# Do NOT reinstall torch on Colab.
+transformers>=4.46.0
+peft>=0.13.0
+datasets>=3.0.0
+accelerate>=1.0.0
+scipy>=1.11
+matplotlib>=3.8
+pandas>=2.0
+num2words
