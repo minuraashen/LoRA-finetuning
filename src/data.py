@@ -52,15 +52,30 @@ def _norm(s: str) -> str:
     return " ".join(str(s).strip().lower().replace(".", " ").split())
 
 
-def _take(ds, n, seed, streaming):
+def _take(ds, n, seed, streaming, conv, label=""):
+    """Draw n examples and convert each one AS IT ARRIVES.
+
+    Converting after collecting would hold every image at full resolution at
+    once: 3,000 TextVQA images (up to 1024 px) are ~7 GB decoded, enough for
+    Colab's 12.7 GB RAM to OOM-kill the process silently. Converting in the
+    loop keeps one full-size image alive at a time (~3 GB total at 512 px).
+    """
     if streaming:
         ds = ds.shuffle(seed=seed, buffer_size=min(5000, max(n * 2, 1000)))
-        return [ex for _, ex in zip(range(n), ds)], None
-    idx = list(range(len(ds)))
-    random.Random(seed).shuffle(idx)
-    keep = sorted(idx[:n])
-    # .select() is lazy; iterating it decodes each image exactly once.
-    return list(ds.select(keep)), keep
+        rows, keep = ds, None
+    else:
+        idx = list(range(len(ds)))
+        random.Random(seed).shuffle(idx)
+        keep = sorted(idx[:n])
+        rows = ds.select(keep)     # lazy; each image is decoded exactly once
+    out = []
+    for i, ex in enumerate(rows):
+        if i >= n:
+            break
+        out.append(conv(ex))
+        if (i + 1) % 500 == 0:
+            print(f"[data] {label}: {i + 1}/{n} examples", flush=True)
+    return out, keep
 
 
 def _yes_no_indices(ds, answer_key):
@@ -102,24 +117,25 @@ def load_task(name: str, n_train=cfg.N_TRAIN, n_eval=cfg.N_EVAL,
         else:
             eval_raw = eval_raw.select(_yes_no_indices(eval_raw, spec["answer_key"]))
 
-    train, train_idx = _take(train_raw, n_train, seed, spec["streaming"])
-    evals, eval_idx = _take(eval_raw, n_eval, seed + 1, spec["streaming"])
+    def conv(ex):
+        return {"image": _prep_image(ex["image"]),
+                "question": ex["question"],
+                "answers": _answers(ex, spec["answer_key"]),
+                "question_id": ex.get("question_id")}
+
+    train, train_idx = _take(train_raw, n_train, seed, spec["streaming"], conv,
+                             f"{name} train")
+    evals, eval_idx = _take(eval_raw, n_eval, seed + 1, spec["streaming"], conv,
+                            f"{name} eval")
 
     # Streaming draws (TextVQA) have no indices; their question_ids are recorded
     # instead, so runs made on different machines can be checked for using
     # the identical subset (analyze.check_subsets).
     def qids(rows):
-        ids = [r.get("question_id") for r in rows]
+        ids = [r["question_id"] for r in rows]
         return None if all(i is None for i in ids) else ids
 
     train_qid, eval_qid = qids(train), qids(evals)
-
-    def conv(ex):
-        return {"image": _prep_image(ex["image"]),
-                "question": ex["question"],
-                "answers": _answers(ex, spec["answer_key"])}
-
-    train, evals = [conv(e) for e in train], [conv(e) for e in evals]
     meta = {"dataset": name, "train_split": spec["train"], "eval_split": spec["eval"],
             "n_train": len(train), "n_eval": len(evals), "subset_seed": seed,
             "yes_no_eval": yes_no_eval, "streaming": spec["streaming"],
