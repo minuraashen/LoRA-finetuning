@@ -203,6 +203,24 @@ def build_prompt(processor, question: str) -> str:
     return processor.apply_chat_template(messages, add_generation_prompt=True)
 
 
+def format_target(answer: str) -> str:
+    """Write a dataset answer in SmolVLM's own answer style: ' Yes.', ' Pink.'.
+
+    The datasets store answers lowercase with no punctuation ('yes'), but the
+    model answers with a capital and a full stop. Measured on the untouched
+    model, the lowercase form costs ~5.7 extra nats on the answer token
+    (12.44 vs 6.73) -- a content-free penalty that would dominate the early
+    gradient, so the vision tower would mostly learn casing rather than the
+    images, contaminating the dM/dD measurement. Scoring is unaffected:
+    evaluate.normalise lowercases and strips punctuation.
+    """
+    a = str(answer).strip()
+    if not a:
+        return a
+    a = a[0].upper() + a[1:]
+    return a if a[-1] in ".!?" else a + "."
+
+
 class SupervisedCollator:
     """Builds batches with the loss masked to the assistant turn only.
 
@@ -228,7 +246,7 @@ class SupervisedCollator:
         input_ids, labels, pixel_values = [], [], []
         for f in features:
             prompt = build_prompt(self.p, f["question"])
-            target = " " + str(f["answers"][0]).strip() + self.eos
+            target = " " + format_target(f["answers"][0]) + self.eos
             n_target = len(self.tok(target, add_special_tokens=False)["input_ids"])
             enc_f = self.p(text=prompt + target, images=[f["image"]], return_tensors="pt")
             full = enc_f["input_ids"][0]

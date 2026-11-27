@@ -137,12 +137,14 @@ def test_label_masking():
     assert not ((labels == img_id).any()), "image tokens leaked into the loss"
     kept = (labels != -100).sum(dim=1)
     assert (kept > 0).all() and (kept < 12).all(), f"suspicious label spans: {kept}"
-    # The supervised span must decode to exactly " answer<eos>" -- this catches
-    # an off-by-one at the prompt/answer boundary.
+    # The supervised span must decode to exactly " Answer.<eos>" (the model's
+    # own style) -- this catches an off-by-one at the prompt/answer boundary.
     tok = processor.tokenizer
-    for row, ans in zip(labels, ["yes", "red"]):
+    for row, ans in zip(labels, ["Yes.", "Red."]):
         got = tok.decode(row[row != -100])
         assert got == " " + ans + tok.eos_token, f"supervised span is {got!r}"
+    assert data_mod.format_target("coca cola") == "Coca cola."
+    assert data_mod.format_target("Yes.") == "Yes."
     print(f"[ok] assistant-only loss masking (supervised tokens per example: {kept.tolist()})")
 
 
