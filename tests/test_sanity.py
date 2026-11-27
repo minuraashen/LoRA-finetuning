@@ -137,11 +137,27 @@ def test_label_masking():
     assert not ((labels == img_id).any()), "image tokens leaked into the loss"
     kept = (labels != -100).sum(dim=1)
     assert (kept > 0).all() and (kept < 12).all(), f"suspicious label spans: {kept}"
+    # The supervised span must decode to exactly " answer<eos>" -- this catches
+    # an off-by-one at the prompt/answer boundary.
+    tok = processor.tokenizer
+    for row, ans in zip(labels, ["yes", "red"]):
+        got = tok.decode(row[row != -100])
+        assert got == " " + ans + tok.eos_token, f"supervised span is {got!r}"
     print(f"[ok] assistant-only loss masking (supervised tokens per example: {kept.tolist()})")
 
 
-ALL = [test_decomposition_math, test_axis_shapes, test_target_modules,
-       test_param_counts, test_dora_is_identity_at_init,
+def test_answer_parsing():
+    """lmms-lab/VQAv2 stores answers as dicts; unwrapped, every probe score is 0."""
+    import data as data_mod
+    vqa = {"answers": [{"answer": "two", "answer_confidence": "yes", "answer_id": 1}]}
+    assert data_mod._answers(vqa, "answers") == ["two"]
+    assert data_mod._answers({"answer": "yes"}, "answer") == ["yes"]
+    assert data_mod._answers({"answers": ["a", "b"]}, "answers") == ["a", "b"]
+    print("[ok] answer parsing (string, list, VQAv2 dict)")
+
+
+ALL = [test_decomposition_math, test_axis_shapes, test_answer_parsing,
+       test_target_modules, test_param_counts, test_dora_is_identity_at_init,
        test_image_token_count, test_label_masking]
 
 if __name__ == "__main__":
