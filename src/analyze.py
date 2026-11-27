@@ -17,9 +17,16 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 
-# DoRA paper sec. 4.1, measured on VL-BART query matrices (a LANGUAGE transformer).
+# DoRA paper sec. 4.1, measured on VL-BART QUERY matrices (Figure 2; a LANGUAGE
+# transformer). Value matrices appear only in appendix Figure 7, without r values.
 PAPER_R = {"ft": -0.62, "lora": 0.83, "dora": -0.31}
 
+# The query-only set is the like-for-like comparison with the paper and the
+# headline everywhere (figures, FT-likeness, H5); value-only and pooled are
+# robustness checks.
+MATRIX_SETS = {"q": ("q_proj",), "v": ("v_proj",), "qv": ("q_proj", "v_proj")}
+HEADLINE_SET = "q"
+ARM_GROUPS = {"V": ("vision",), "L": ("text",), "B": ("vision", "text")}
 RESULTS_DIR = os.environ.get("RESULTS_DIR", "results")
 FIG_DIR = os.environ.get("FIG_DIR", "figures")
 
@@ -47,24 +54,34 @@ def decomposition_frame(records) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
-def correlations(df, axis="out", matrices=("q_proj", "v_proj")) -> pd.DataFrame:
-    """One (dD, dM) correlation per (run, module group).
+def correlations(df, axis="out", matrix_set=HEADLINE_SET) -> pd.DataFrame:
+    """One (dD, dM) correlation per (run, module group) for one matrix set.
 
-    Restricted to query/value matrices by default, which is exactly what DoRA
-    Figure 2 plots; pass matrices=None to use every tracked matrix.
+    The default, query matrices only, is exactly what DoRA Figure 2 plots and
+    what its -0.62 / +0.83 / -0.31 were computed on.
     """
-    sub = df[df.axis == axis]
-    if matrices:
-        sub = sub[sub.matrix.isin(matrices)]
+    matrices = MATRIX_SETS[matrix_set]
+    sub = df[(df.axis == axis) & df.matrix.isin(matrices)]
     rows = []
     for (run_id, group), g in sub.groupby(["run_id", "group"]):
+        # Only the towers the arm trains: frozen matrices carry float-noise
+        # deltas (~1e-8) that would otherwise yield meaningless correlations.
+        if group not in ARM_GROUPS.get(g.arm.iloc[0], ()):
+            continue
         g = g[(g.delta_m.abs() > 0) | (g.delta_d.abs() > 0)]
         if len(g) < 3:
             continue
-        r, p = stats.pearsonr(g.delta_d, g.delta_m)
-        slope = np.polyfit(g.delta_d, g.delta_m, 1)[0]
+        method = g.method.iloc[0]
+        if method == "magonly" or (method == "magV_doraL" and group == "vision"):
+            # Magnitude-only layers cannot change direction (dD is ~1e-8 float
+            # noise); a correlation against noise is undefined, not a number.
+            r = p = slope = np.nan
+        else:
+            r, p = stats.pearsonr(g.delta_d, g.delta_m)
+            slope = np.polyfit(g.delta_d, g.delta_m, 1)[0]
         first = g.iloc[0]
         rows.append({"run_id": run_id, "group": group, "axis": axis,
+                     "matrix_set": matrix_set,
                      "method": first.method, "arm": first.arm,
                      "dataset": first.dataset, "seed": first.seed,
                      "r": r, "p_value": p, "slope": slope, "n_points": len(g),
@@ -80,10 +97,10 @@ def ft_likeness(corr: pd.DataFrame) -> pd.DataFrame:
         corr["r_ft"] = np.nan
         corr["ft_likeness"] = np.nan
         return corr
-    ref = (corr[corr.method == "ft"]
-           .set_index(["dataset", "arm", "group", "axis"])["r"].rename("r_ft"))
+    keys = ["dataset", "arm", "group", "axis", "matrix_set"]
+    ref = corr[corr.method == "ft"].set_index(keys)["r"].rename("r_ft")
     ref = ref[~ref.index.duplicated()]
-    out = corr.join(ref, on=["dataset", "arm", "group", "axis"])
+    out = corr.join(ref, on=keys)
     out["ft_likeness"] = -(out["r"] - out["r_ft"]).abs()
     return out
 
@@ -92,6 +109,7 @@ def h5_test(corr_with_likeness: pd.DataFrame, group="vision") -> dict:
     """Does FT-likeness predict accuracy? With ~8-12 points this is suggestive,
     not conclusive -- the report must say so, and a null result is a result."""
     sub = corr_with_likeness[(corr_with_likeness.group == group)
+                             & (corr_with_likeness.matrix_set == HEADLINE_SET)
                              & corr_with_likeness.ft_likeness.notna()
                              & (corr_with_likeness.method != "ft")]
     if len(sub) < 4:
@@ -151,7 +169,7 @@ def _scatter(ax, g, title, paper_r=None):
 
 
 def figure1_pattern(df, dataset="pathvqa", axis="out",
-                    matrices=("q_proj", "v_proj"), out=None):
+                    matrices=MATRIX_SETS[HEADLINE_SET], out=None):
     """The DoRA Figure 2 replication: {FT, LoRA, DoRA} x {vision encoder, LM}.
 
     This single figure answers H1 (does the pattern hold in the vision tower)
@@ -241,13 +259,40 @@ def figure3_params_vs_accuracy(summary, baseline=None, out=None):
     return out
 
 
+def check_subsets(records) -> dict:
+    """Runs merged from several machines must share one data subset per
+    (dataset, seed). Fingerprints the recorded indices / question ids and
+    reports any (dataset, seed) whose runs disagree."""
+    import hashlib
+    seen = {}
+    for rec in records:
+        d = rec["data"]
+        ids = {k: d.get(k) for k in ("train_indices", "eval_indices",
+                                     "train_question_ids", "eval_question_ids")}
+        fp = hashlib.sha1(json.dumps(ids, sort_keys=True).encode()).hexdigest()[:10]
+        seen.setdefault((d["dataset"], d["subset_seed"]), {}).setdefault(fp, []).append(
+            rec["spec"]["run_id"])
+    bad = {f"{ds}/seed{s}": groups for (ds, s), groups in seen.items() if len(groups) > 1}
+    if bad:
+        print("[WARN] runs on the same dataset+seed used DIFFERENT subsets -- "
+              "rerun one group so all match:")
+        for key, groups in bad.items():
+            for fp, runs in groups.items():
+                print(f"   {key} subset {fp}: {', '.join(runs)}")
+    else:
+        print("[ok] every dataset+seed used one identical subset across all runs")
+    return bad
+
+
 def run_all(results_dir=RESULTS_DIR):
     records = load_runs(results_dir)
     if not records:
         raise SystemExit("no result JSONs in {}".format(results_dir))
+    check_subsets(records)
     df = decomposition_frame(records)
     summary = summary_table(records)
-    corr = pd.concat([correlations(df, axis=a) for a in ("out", "in")],
+    corr = pd.concat([correlations(df, axis=a, matrix_set=s)
+                      for a in ("out", "in") for s in MATRIX_SETS],
                      ignore_index=True)
     corr = ft_likeness(corr)
 
@@ -282,7 +327,8 @@ if __name__ == "__main__":
     print(res["summary"].to_string(index=False))
     print()
     cols = ["run_id", "group", "r", "slope", "ft_likeness", "headline"]
-    print(res["correlations"].query("axis == 'out'")[cols].to_string(index=False))
+    print(res["correlations"].query("axis == 'out' and matrix_set == @HEADLINE_SET")[cols]
+          .to_string(index=False))
     print()
     print(json.dumps(res["h5"], indent=2))
     print("figures:", res["figures"])

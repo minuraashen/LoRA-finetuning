@@ -53,8 +53,10 @@ def delta_m_d(W0: torch.Tensor, Wt: torch.Tensor, axis: str = "out"):
     """(dM, dD) between a pretrained weight and a finetuned/merged weight."""
     if W0.shape != Wt.shape:
         raise ValueError(f"shape mismatch: {tuple(W0.shape)} vs {tuple(Wt.shape)}")
-    A = _vectors(W0.float(), axis)
-    B = _vectors(Wt.float(), axis)
+    # float64: 1 - cos has a float32 noise floor of ~1e-7, the same order as a
+    # small learning rate's early direction change. CPU cost is negligible.
+    A = _vectors(W0.double(), axis)
+    B = _vectors(Wt.double(), axis)
     m0 = torch.linalg.norm(A, dim=1)
     mt = torch.linalg.norm(B, dim=1)
     dM = (mt - m0).abs().mean()
