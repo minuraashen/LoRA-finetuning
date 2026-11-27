@@ -19,7 +19,12 @@ import re
 
 import torch
 from peft import LoraConfig, get_peft_model
-from transformers import AutoProcessor, AutoModelForVision2Seq
+from transformers import AutoProcessor
+
+try:  # transformers >= 4.46; AutoModelForVision2Seq was removed in 5.x
+    from transformers import AutoModelForImageTextToText as _AutoVLM
+except ImportError:  # older 4.x
+    from transformers import AutoModelForVision2Seq as _AutoVLM
 
 import config as cfg
 
@@ -44,9 +49,21 @@ def load_base_model(dtype=torch.float32):
     source of the NaNs the assignment warns about. fp32 weights + fp16 autocast
     costs ~1 GB and removes the problem.
     """
-    model = AutoModelForVision2Seq.from_pretrained(
-        cfg.MODEL_ID, torch_dtype=dtype, attn_implementation="eager")
+    try:
+        model = _AutoVLM.from_pretrained(
+            cfg.MODEL_ID, dtype=dtype, attn_implementation=ATTN_IMPL)
+    except TypeError:  # transformers 4.x spells the argument torch_dtype
+        model = _AutoVLM.from_pretrained(
+            cfg.MODEL_ID, torch_dtype=dtype, attn_implementation=ATTN_IMPL)
     return model
+
+
+# SDPA, not eager: the SigLIP tower attends over 1024 patches per image, and
+# eager attention keeps a 1024x1024 score matrix per head, layer and image for
+# backward -- ~12 GB at batch 8 with only the vision LoRA trainable, enough to
+# OOM a 16 GB T4. SDPA computes the same function without materialising it.
+import os as _os
+ATTN_IMPL = _os.environ.get("ATTN_IMPL", "sdpa")
 
 
 # --- helpers -----------------------------------------------------------------
