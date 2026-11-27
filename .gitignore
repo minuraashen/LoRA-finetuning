@@ -4,3 +4,6 @@ __pycache__/
 results/*.json
 figures/*.png
 hf_cache/
+.venv/
+ckpt/
+logs/
