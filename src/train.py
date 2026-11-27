@@ -6,6 +6,7 @@ batch, because run_grid.py skips any spec whose JSON already exists.
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 
@@ -45,6 +46,11 @@ class DecompositionCallback(TrainerCallback):
             self.base, self.model, int(state.global_step), frac))
 
 
+def _warmup_steps(n_examples, ratio=0.03):
+    per_epoch = math.ceil(n_examples / (cfg.PER_DEVICE_BS * cfg.GRAD_ACCUM))
+    return max(1, math.ceil(ratio * per_epoch * cfg.EPOCHS))
+
+
 def _loss_history(trainer):
     return [{"step": h["step"], "loss": h["loss"]}
             for h in trainer.state.log_history if "loss" in h]
@@ -55,6 +61,14 @@ def run(spec, processor=None, probe=None, overwrite=False, n_train=None, n_eval=
     if os.path.exists(out_path) and not overwrite:
         print(f"[skip] {spec.run_id} (result exists)")
         return json.load(open(out_path, encoding="utf-8"))
+
+    # Kaggle's "T4 x2": with both GPUs visible the Trainer silently wraps the
+    # model in DataParallel and doubles the effective batch, so these runs would
+    # not be comparable with single-GPU Colab runs. One process per GPU instead.
+    if torch.cuda.is_available() and torch.cuda.device_count() > 1:
+        raise RuntimeError(
+            f"{torch.cuda.device_count()} GPUs visible; set CUDA_VISIBLE_DEVICES to one GPU "
+            "per process (the Kaggle notebook runs one shard per GPU)")
 
     os.makedirs(RESULTS_DIR, exist_ok=True)
     t0 = time.time()
@@ -79,7 +93,9 @@ def run(spec, processor=None, probe=None, overwrite=False, n_train=None, n_eval=
         gradient_accumulation_steps=cfg.GRAD_ACCUM,
         num_train_epochs=cfg.EPOCHS,
         learning_rate=spec.lr_resolved,
-        warmup_ratio=0.03,
+        # 3% warmup, as an explicit step count: transformers 5.x removed
+        # warmup_ratio, and warmup_steps behaves identically on 4.x.
+        warmup_steps=_warmup_steps(len(train_ex)),
         max_grad_norm=1.0,                 # fp16 + AdamW NaN guard
         fp16=torch.cuda.is_available(),    # T4 has no hardware bf16
         logging_steps=20,
@@ -88,7 +104,9 @@ def run(spec, processor=None, probe=None, overwrite=False, n_train=None, n_eval=
         remove_unused_columns=False,
         label_names=["labels"],
         seed=spec.seed,
-        dataloader_num_workers=2,
+        # Windows spawns workers and would pickle the whole in-memory image list
+        # into each one; collate in the main process there.
+        dataloader_num_workers=0 if os.name == "nt" else 2,
     )
     trainer = Trainer(model=model, args=args, train_dataset=train_ex,
                       data_collator=data_mod.SupervisedCollator(processor),
@@ -103,6 +121,14 @@ def run(spec, processor=None, probe=None, overwrite=False, n_train=None, n_eval=
 
     train_out = trainer.train()
 
+    # fp16 overflow guard: a NaN/inf weight would still produce a JSON with
+    # plausible-looking decomposition rows, so count them and say so loudly.
+    nonfinite = sum(int((~torch.isfinite(p)).sum()) for p in model.parameters()
+                    if p.requires_grad)
+    if nonfinite:
+        print(f"[WARN] {spec.run_id}: {nonfinite} non-finite trainable weights -- "
+              "lower the learning rate and rerun with --overwrite")
+
     acc, preds = ev.evaluate_task(model, processor, eval_ex, yes_no=meta["yes_no_eval"])
     forget = ev.evaluate_forgetting(model, processor, probe) if probe else None
 
@@ -112,7 +138,8 @@ def run(spec, processor=None, probe=None, overwrite=False, n_train=None, n_eval=
         "data": meta,
         "train": {"loss_history": _loss_history(trainer),
                   "final_loss": float(train_out.training_loss),
-                  "steps": int(trainer.state.global_step)},
+                  "steps": int(trainer.state.global_step),
+                  "nonfinite_weights": nonfinite},
         "accuracy": acc,
         "forgetting": forget,
         "decomposition": cb.rows,
@@ -136,7 +163,9 @@ def zero_shot_baselines(processor=None, probe=None, n_eval=None):
     model = load_base_model().to("cuda" if torch.cuda.is_available() else "cpu")
     out = {}
     for ds in cfg.DATASETS:
-        _, eval_ex, meta = data_mod.load_task(ds, n_train=1, n_eval=n_eval or cfg.N_EVAL)
+        # Same arguments as a seed-42 run, so the subset cache is shared and the
+        # baseline is scored on exactly the examples the adapted models see.
+        _, eval_ex, meta = data_mod.load_task(ds, n_eval=n_eval or cfg.N_EVAL)
         acc, _ = ev.evaluate_task(model, processor, eval_ex, yes_no=meta["yes_no_eval"])
         out[ds] = acc
     if probe:
