@@ -79,9 +79,25 @@ python run_grid.py --tiers 2                 # then 3, then 4
 python src/analyze.py                        # tables + figures
 ```
 
-26 runs, ~13 h of T4 — **3–4 Colab sessions, not one sitting**. Tiers are the risk plan:
-each adds one hypothesis, and any spec whose JSON already exists is skipped, so a
-disconnect costs one run rather than the batch.
+26 runs at an estimated 45–75 min each on a T4 (not yet measured on a T4) — **several
+sessions, not one sitting**. Tiers are the risk plan: each adds one hypothesis, and any spec
+whose JSON already exists is skipped, so a disconnect costs one run rather than the batch.
+
+### Colab and Kaggle in parallel
+
+`--shard K/N` deals the full 26-run grid round-robin, so every machine computes the same
+split. The plan uses five shards of 5–6 runs:
+
+| where | notebook | shards |
+|---|---|---|
+| Kaggle session 1 (GPU T4 x2, one shard per GPU) | `kaggle.ipynb` | `0/5`, `1/5` (+ zero-shot baseline) |
+| Colab | `notebook.ipynb` | `2/5` |
+| Kaggle session 2 | `kaggle.ipynb`, `SHARDS = ["3/5", "4/5"]` | `3/5`, `4/5` |
+
+Merge every `results/*.json` into one folder, then run `python src/analyze.py`; it first
+checks that all runs on a dataset used the identical subset. The training libraries are
+pinned exactly in `requirements.txt` for that reason. Never let one process see both Kaggle
+GPUs: the Trainer would switch to DataParallel and double the batch, and `train.py` refuses.
 
 ## Three details that silently ruin this experiment
 
